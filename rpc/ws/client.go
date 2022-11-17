@@ -101,6 +101,9 @@ func (c *Client) connect(ctx context.Context, rpcEndpoint string, opt *Options) 
 	if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
 		httpHeader = opt.HttpHeader
 	}
+	if opt != nil {
+		c.reconnectOnErr = opt.AutoReconnect
+	}
 	c.conn, _, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
 	if err != nil {
 		return fmt.Errorf("new ws client: dial: %w", err)
@@ -133,42 +136,47 @@ func (c *Client) receiveMessages() {
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			// reconnect websocket
-			c.lock.Lock()
-			err := backoff.Retry(
-				func() error {
-					if err := c.connect(c.ctx, c.rpcURL, c.opt); err != nil {
-						return err
-					}
-					c.setupHandler()
-					return nil
-				},
-				backoff.NewExponentialBackOff(),
-			)
-			c.lock.Unlock()
-			if err != nil {
-				c.closeAllSubscription(err)
-				return
-			}
+			if c.reconnectOnErr {
+				// reconnect websocket
+				c.lock.Lock()
+				err := backoff.Retry(
+					func() error {
+						if err := c.connect(c.ctx, c.rpcURL, c.opt); err != nil {
+							return err
+						}
+						c.setupHandler()
+						return nil
+					},
+					backoff.NewExponentialBackOff(),
+				)
+				c.lock.Unlock()
+				if err != nil {
+					c.closeAllSubscription(err)
+					return
+				}
 
-			// resubscribe all current subscription
-			reqIDsToRetry := make(map[uint64]struct{})
-			for reqID := range c.subscriptionByRequestID {
-				reqIDsToRetry[reqID] = struct{}{}
-			}
-			err = backoff.Retry(
-				func() error {
-					if err := c.resubscribe(reqIDsToRetry); err != nil {
-						return err
-					}
-					if len(reqIDsToRetry) > 0 {
-						return fmt.Errorf("still subscribing")
-					}
-					return nil
-				},
-				backoff.NewExponentialBackOff(),
-			)
-			if err != nil {
+				// resubscribe all current subscription
+				reqIDsToRetry := make(map[uint64]struct{})
+				for reqID := range c.subscriptionByRequestID {
+					reqIDsToRetry[reqID] = struct{}{}
+				}
+				err = backoff.Retry(
+					func() error {
+						if err := c.resubscribe(reqIDsToRetry); err != nil {
+							return err
+						}
+						if len(reqIDsToRetry) > 0 {
+							return fmt.Errorf("still subscribing")
+						}
+						return nil
+					},
+					backoff.NewExponentialBackOff(),
+				)
+				if err != nil {
+					c.closeAllSubscription(err)
+					return
+				}
+			} else {
 				c.closeAllSubscription(err)
 				return
 			}

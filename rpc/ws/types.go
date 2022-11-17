@@ -63,5 +63,6 @@ type params struct {
 }
 
 type Options struct {
-	HttpHeader http.Header
+	HttpHeader    http.Header
+	AutoReconnect bool
 }
