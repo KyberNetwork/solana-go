@@ -19,6 +19,7 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,8 +38,7 @@ type result interface{}
 
 type Client struct {
 	rpcURL                  string
-	opt                     *Options
-	ctx                     context.Context
+	connect                 func() error
 	conn                    *websocket.Conn
 	lock                    sync.RWMutex
 	subscriptionByRequestID map[uint64]*Subscription
@@ -69,13 +69,30 @@ func Connect(ctx context.Context, rpcEndpoint string) (c *Client, err error) {
 func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (c *Client, err error) {
 	c = &Client{
 		rpcURL:                  rpcEndpoint,
-		opt:                     opt,
-		ctx:                     ctx,
 		subscriptionByRequestID: map[uint64]*Subscription{},
 		subscriptionByWSSubID:   map[uint64]*Subscription{},
 	}
+	c.connect = func() error {
+		dialer := &websocket.Dialer{
+			Proxy:             http.ProxyFromEnvironment,
+			HandshakeTimeout:  45 * time.Second,
+			EnableCompression: true,
+		}
+		var httpHeader http.Header = nil
+		if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
+			httpHeader = opt.HttpHeader
+		}
+		if opt != nil {
+			c.reconnectOnErr = opt.AutoReconnect
+		}
+		c.conn, _, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
+		if err != nil {
+			return fmt.Errorf("new ws client: dial: %w", err)
+		}
+		return nil
+	}
 
-	if err := c.connect(ctx, rpcEndpoint, opt); err != nil {
+	if err := c.connect(); err != nil {
 		return nil, err
 	}
 
@@ -91,26 +108,6 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 	}()
 	go c.receiveMessages()
 	return c, nil
-}
-
-func (c *Client) connect(ctx context.Context, rpcEndpoint string, opt *Options) (err error) {
-	dialer := &websocket.Dialer{
-		Proxy:             http.ProxyFromEnvironment,
-		HandshakeTimeout:  45 * time.Second,
-		EnableCompression: true,
-	}
-	var httpHeader http.Header = nil
-	if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
-		httpHeader = opt.HttpHeader
-	}
-	if opt != nil {
-		c.reconnectOnErr = opt.AutoReconnect
-	}
-	c.conn, _, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
-	if err != nil {
-		return fmt.Errorf("new ws client: dial: %w", err)
-	}
-	return nil
 }
 
 func (c *Client) setupHandler() {
@@ -138,12 +135,15 @@ func (c *Client) receiveMessages() {
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
+			for _, s := range c.subscriptionByWSSubID {
+				s.err <- errors.New("connection lost")
+			}
 			if c.reconnectOnErr {
 				// reconnect websocket
 				c.lock.Lock()
 				err := backoff.Retry(
 					func() error {
-						if err := c.connect(c.ctx, c.rpcURL, c.opt); err != nil {
+						if err := c.connect(); err != nil {
 							return err
 						}
 						c.setupHandler()
