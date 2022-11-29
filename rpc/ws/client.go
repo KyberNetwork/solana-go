@@ -19,6 +19,7 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/buger/jsonparser"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/gorilla/rpc/v2/json2"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -36,6 +38,7 @@ type result interface{}
 
 type Client struct {
 	rpcURL                  string
+	connect                 func() error
 	conn                    *websocket.Conn
 	lock                    sync.RWMutex
 	subscriptionByRequestID map[uint64]*Subscription
@@ -61,31 +64,40 @@ func Connect(ctx context.Context, rpcEndpoint string) (c *Client, err error) {
 // endpoint with a http header if available The http header can be helpful to
 // pass basic authentication params as prescribed
 // ref https://github.com/gorilla/websocket/issues/209
+// Or create a new websocket client with auto reconnecting when
+// the websocket connection is dropped by setting opt.AutoReconnect = true
 func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (c *Client, err error) {
 	c = &Client{
 		rpcURL:                  rpcEndpoint,
 		subscriptionByRequestID: map[uint64]*Subscription{},
 		subscriptionByWSSubID:   map[uint64]*Subscription{},
 	}
-
-	dialer := &websocket.Dialer{
-		Proxy:             http.ProxyFromEnvironment,
-		HandshakeTimeout:  45 * time.Second,
-		EnableCompression: true,
+	c.connect = func() error {
+		dialer := &websocket.Dialer{
+			Proxy:             http.ProxyFromEnvironment,
+			HandshakeTimeout:  45 * time.Second,
+			EnableCompression: true,
+		}
+		var httpHeader http.Header = nil
+		if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
+			httpHeader = opt.HttpHeader
+		}
+		if opt != nil {
+			c.reconnectOnErr = opt.AutoReconnect
+		}
+		c.conn, _, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
+		if err != nil {
+			return fmt.Errorf("new ws client: dial: %w", err)
+		}
+		return nil
 	}
 
-	var httpHeader http.Header = nil
-	if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
-		httpHeader = opt.HttpHeader
-	}
-	c.conn, _, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
-	if err != nil {
-		return nil, fmt.Errorf("new ws client: dial: %w", err)
+	if err := c.connect(); err != nil {
+		return nil, err
 	}
 
 	go func() {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+		c.setupHandler()
 		ticker := time.NewTicker(pingPeriod)
 		for {
 			select {
@@ -96,6 +108,11 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 	}()
 	go c.receiveMessages()
 	return c, nil
+}
+
+func (c *Client) setupHandler() {
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 }
 
 func (c *Client) sendPing() {
@@ -118,10 +135,56 @@ func (c *Client) receiveMessages() {
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			c.closeAllSubscription(err)
-			return
+			for _, s := range c.subscriptionByWSSubID {
+				s.err <- errors.New("connection lost")
+			}
+			if c.reconnectOnErr {
+				// reconnect websocket
+				c.lock.Lock()
+				err := backoff.Retry(
+					func() error {
+						if err := c.connect(); err != nil {
+							return err
+						}
+						c.setupHandler()
+						return nil
+					},
+					backoff.NewExponentialBackOff(),
+				)
+				c.lock.Unlock()
+				if err != nil {
+					c.closeAllSubscription(err)
+					return
+				}
+
+				// resubscribe all current subscription
+				reqIDsToRetry := make(map[uint64]struct{})
+				for reqID := range c.subscriptionByRequestID {
+					reqIDsToRetry[reqID] = struct{}{}
+				}
+				err = backoff.Retry(
+					func() error {
+						if err := c.resubscribe(reqIDsToRetry); err != nil {
+							return err
+						}
+						if len(reqIDsToRetry) > 0 {
+							return fmt.Errorf("still subscribing")
+						}
+						return nil
+					},
+					backoff.NewExponentialBackOff(),
+				)
+				if err != nil {
+					c.closeAllSubscription(err)
+					return
+				}
+			} else {
+				c.closeAllSubscription(err)
+				return
+			}
+		} else {
+			c.handleMessage(message)
 		}
-		c.handleMessage(message)
 	}
 }
 
@@ -298,6 +361,7 @@ func (c *Client) subscribe(
 		func(err error) {
 			c.closeSubscription(req.ID, err)
 		},
+		subscriptionMethod,
 		unsubscribeMethod,
 		decoderFunc,
 	)
@@ -313,6 +377,35 @@ func (c *Client) subscribe(
 	}
 
 	return sub, nil
+}
+
+func (c *Client) resubscribe(requestIDs map[uint64]struct{}) error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	var subscribedRequestIDs []uint64
+	for reqID := range requestIDs {
+		sub := c.subscriptionByRequestID[reqID]
+		data, err := sub.req.encode()
+		if err != nil {
+			return fmt.Errorf("subscribe: unable to encode subsciption request: %w", err)
+		}
+
+		delete(c.subscriptionByWSSubID, sub.subID)
+		sub.subID = 0 // reset subID, it will be updated later in handleNewSubscriptionMessage
+
+		c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		err = c.conn.WriteMessage(websocket.TextMessage, data)
+		if err != nil {
+			return fmt.Errorf("unable to write request: %w", err)
+		}
+		subscribedRequestIDs = append(subscribedRequestIDs, reqID)
+	}
+	for _, reqID := range subscribedRequestIDs {
+		delete(requestIDs, reqID)
+	}
+
+	return nil
 }
 
 func decodeResponseFromReader(r io.Reader, reply interface{}) (err error) {
